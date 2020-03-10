@@ -16,41 +16,27 @@ import torch.optim
 import torch.utils.data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import vgg
 
 import nics_fix_pt as nfp
 import nics_fix_pt.nn_fix as nnf
+from net import FixNet
 
-model_names = sorted(
-    name
-    for name in vgg.__dict__
-    if name.islower()
-    and not name.startswith("__")
-    and name.startswith("vgg")
-    and callable(vgg.__dict__[name])
-)
-
-
-parser = argparse.ArgumentParser(description="PyTorch ImageNet Training")
+parser = argparse.ArgumentParser(description="PyTorch Cifar10 Fixed-Point Training")
 parser.add_argument(
-    "--arch",
-    "-a",
-    metavar="ARCH",
-    default="vgg19",
-    choices=model_names,
-    help="model architecture: " + " | ".join(model_names) + " (default: vgg19)",
+    "--save-dir",
+    required=True,
+    help="The directory used to save the trained models",
+    type=str,
 )
 parser.add_argument(
-    "-j",
-    "--workers",
-    default=4,
-    type=int,
-    metavar="N",
-    help="number of data loading workers (default: 4)",
+    "--gpu",
+    metavar="GPUs",
+    default="0",
+    help="The gpu devices to use"
 )
 parser.add_argument(
-    "--epoches",
-    default=150,
+    "--epoch",
+    default=100,
     type=int,
     metavar="N",
     help="number of total epochs to run",
@@ -73,7 +59,7 @@ parser.add_argument(
 parser.add_argument(
     "--test-batch-size",
     type=int,
-    default=1000,
+    default=32,
     metavar="N",
     help="input batch size for testing (default: 1000)",
 )
@@ -117,9 +103,34 @@ parser.add_argument(
     help="checkpoint prefix (default: none)",
 )
 parser.add_argument(
+    "--float-bn",
+    default=False,
+    action="store_true",
+    help="quantize the bn layer"
+)
+parser.add_argument(
+    "--fix-grad",
+    default=False,
+    action="store_true",
+    help="quantize the gradients"
+)
+parser.add_argument(
+    "--range-method",
+    default=0,
+    choices=[0, 1, 3],
+    help=("range methods of data (including parameters, buffers, activations). "
+          "0: RANGE_MAX, 1: RANGE_3SIGMA, 3: RANGE_SWEEP")
+)
+parser.add_argument(
+    "--grad-range-method",
+    default=0,
+    choices=[0, 1, 3],
+    help=("range methods of gradients (including parameters, activations)."
+          " 0: RANGE_MAX, 1: RANGE_3SIGMA, 3: RANGE_SWEEP")
+)
+parser.add_argument(
     "-e",
     "--evaluate",
-    dest="evaluate",
     action="store_true",
     help="evaluate model on validation set",
 )
@@ -127,35 +138,79 @@ parser.add_argument(
     "--pretrained", default="", type=str, metavar="PATH", help="use pre-trained model"
 )
 parser.add_argument(
-    "--half", dest="half", action="store_true", help="use half-precision(16-bit) "
+    "--bitwidth-data", default=8, type=int, help="the bitwidth of parameters/buffers/activations"
 )
 parser.add_argument(
-    "--save-dir",
-    dest="save_dir",
-    help="The directory used to save the trained models",
-    default="save_temp",
-    type=str,
+    "--bitwidth-grad", default=16, type=int, help="the bitwidth of gradients of parameters/activations"
 )
 
 best_prec1 = 90
 start = time.time()
 
+def _set_fix_method_train_ori(model):
+    model.set_fix_method(nfp.FIX_AUTO)
+
+def _set_fix_method_eval_ori(model):
+    model.set_fix_method(nfp.FIX_FIXED)
+
+## --------
+## When bitwidth is small, bn fix would prevent the model from learning.
+## Could use this following config:
+## Note that batchnorm2d_fix buffers (running_mean, running_var) are handled specially here.
+## The running_mean and running_var are not quantized during training forward process,
+## only quantized during test process. This could help avoid the buffer accumulation problem
+## when the bitwidth is too small.
+def _set_fix_method_train(model):
+    model.set_fix_method(
+        nfp.FIX_AUTO,
+        method_by_type={
+            "BatchNorm2d_fix": {
+                "weight": nfp.FIX_AUTO,
+                "bias": nfp.FIX_AUTO,
+                "running_mean": nfp.FIX_NONE,
+                "running_var": nfp.FIX_NONE}
+        })
+
+def _set_fix_method_eval(model):
+    model.set_fix_method(
+        nfp.FIX_FIXED,
+        method_by_type={
+            "BatchNorm2d_fix": {
+                "weight": nfp.FIX_FIXED,
+                "bias": nfp.FIX_FIXED,
+                "running_mean": nfp.FIX_AUTO,
+                "running_var": nfp.FIX_AUTO}
+        })
+## --------
+
 
 def main():
     global args, best_prec1
     args = parser.parse_args()
+    print("cmd line arguments: ", args)
 
+    gpus = [int(d) for d in args.gpu.split(",")]
+    torch.cuda.set_device(gpus[0])
+        
     # Check the save_dir exists or not
     if not os.path.exists(args.save_dir):
         os.makedirs(args.save_dir)
 
-    model = vgg.__dict__[args.arch]()
-    for module in model.modules():
-        print(module)
+    model = FixNet(
+        fix_bn=not args.float_bn,
+        fix_grad=args.fix_grad,
+        range_method=args.range_method,
+        grad_range_method=args.grad_range_method,
+        bitwidth_data=args.bitwidth_data,
+        bitwidth_grad=args.bitwidth_grad
+    )
     model.print_fix_configs()
 
-    # model.features = torch.nn.DataParallel(model.features)
     model.cuda()
+    if len(gpus) > 1:
+        parallel_model = torch.nn.DataParallel(model, gpus)
+    else:
+        parallel_model = model
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -185,7 +240,7 @@ def main():
             print("=> no checkpoint found at '{}'".format(args.resume))
             assert os.path.isfile(args.pretrained)
 
-    cudnn.benchmark = True
+    # cudnn.benchmark = True
 
     normalize = transforms.Normalize(
         mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -207,7 +262,7 @@ def main():
         ),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.workers,
+        num_workers=4,
         pin_memory=True,
     )
 
@@ -219,16 +274,12 @@ def main():
         ),
         batch_size=args.test_batch_size,
         shuffle=False,
-        num_workers=args.workers,
+        num_workers=2,
         pin_memory=True,
     )
 
     # define loss function (criterion) and pptimizer
     criterion = nn.CrossEntropyLoss().cuda()
-
-    if args.half:
-        model.half()
-        criterion.half()
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -236,28 +287,19 @@ def main():
         momentum=args.momentum,
         weight_decay=args.weight_decay,
     )
-    """
-    ignored_params = list(map(id, model.fc.parameters()))
-    base_params = filter(lambda p: id(p) not in ignored_params, model.parameters())
-    optimizer = torch.optim.SGD([
-            {'params': base_params},
-            {'params': model.fc.parameters(), 'lr': 5e-2}
-            ], 
-            lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-    """
 
     if args.evaluate:
-        validate(val_loader, model, criterion)
+        validate(val_loader, model, parallel_model, criterion)
         return
 
-    for epoch in range(args.start_epoch, args.epoches):
+    for epoch in range(args.start_epoch, args.epoch):
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, parallel_model, criterion, optimizer, epoch)
 
         # evaluate on validation set
-        prec1 = validate(val_loader, model, criterion)
+        prec1 = validate(val_loader, model, parallel_model, criterion)
 
         # remember best prec@1 and save checkpoint
         is_best = prec1 > best_prec1
@@ -275,12 +317,12 @@ def main():
                     "checkpoint_{}_{:.3f}.tar".format(args.prefix, best_prec1),
                 ),
             )
+            model.print_fix_configs()
 
-    # model.print_fix_configs()
     print("Best acc: {}".format(best_prec1))
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, p_model, criterion, optimizer, epoch):
     """
         Run one train epoch
     """
@@ -288,20 +330,16 @@ def train(train_loader, model, criterion, optimizer, epoch):
     top1 = AverageMeter()
 
     # switch to train mode
-    model.set_fix_method(nfp.FIX_AUTO)
-    # model.set_fix_method(nfp.FIX_NONE)
+    _set_fix_method_train_ori(model)
     model.train()
 
     for i, (input, target) in enumerate(train_loader):
-
         target = target.cuda(async=True)
         input_var = torch.autograd.Variable(input).cuda()
         target_var = torch.autograd.Variable(target)
-        if args.half:
-            input_var = input_var.half()
 
         # compute output
-        output = model(input_var)
+        output = p_model(input_var)
         loss = criterion(output, target_var)
 
         # compute gradient and do SGD step
@@ -333,7 +371,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
             )
 
 
-def validate(val_loader, model, criterion):
+def validate(val_loader, model, p_model, criterion):
     """
     Run evaluation
     """
@@ -341,41 +379,37 @@ def validate(val_loader, model, criterion):
     top1 = AverageMeter()
 
     # switch to evaluate mode
-    model.set_fix_method(nfp.FIX_FIXED)
-    # model.set_fix_method(nfp.FIX_NONE)
+    _set_fix_method_eval_ori(model)
     model.eval()
 
-    for i, (input, target) in enumerate(val_loader):
-        target = target.cuda(async=True)
-        input_var = torch.autograd.Variable(input, volatile=True).cuda()
-        target_var = torch.autograd.Variable(target, volatile=True)
-
-        if args.half:
-            input_var = input_var.half()
-
-        # compute output
-        output = model(input_var)
-        loss = criterion(output, target_var)
-
-        output = output.float()
-        loss = loss.float()
-
-        # measure accuracy and record loss
-        prec1 = accuracy(output.data, target)[0]
-        losses.update(loss.item(), input.size(0))
-        top1.update(prec1.item(), input.size(0))
-
-        if i % args.print_freq == 0:
-            print(
-                "Test: [{0}/{1}]\t"
-                "Time {t}\t"
-                "Loss {loss.val:.4f} ({loss.avg:.4f})\t"
-                "Prec@1 {top1.val:.3f}% ({top1.avg:.3f}%)".format(
-                    i, len(val_loader), t=time.time() - start, loss=losses, top1=top1
+    with torch.no_grad():
+        for i, (input, target) in enumerate(val_loader):
+            target = target.cuda(async=True)
+            input_var = torch.autograd.Variable(input).cuda()
+            target_var = torch.autograd.Variable(target)
+    
+            # compute output
+            output = p_model(input_var)
+            loss = criterion(output, target_var)
+    
+            output = output.float()
+            loss = loss.float()
+    
+            # measure accuracy and record loss
+            prec1 = accuracy(output.data, target)[0]
+            losses.update(loss.item(), input.size(0))
+            top1.update(prec1.item(), input.size(0))
+    
+            if i % args.print_freq == 0:
+                print(
+                    "Test: [{0}/{1}]\t"
+                    "Time {t}\t"
+                    "Loss {loss.val:.4f} ({loss.avg:.4f})\t"
+                    "Prec@1 {top1.val:.3f}% ({top1.avg:.3f}%)".format(
+                        i, len(val_loader), t=time.time() - start, loss=losses, top1=top1
+                    )
                 )
-            )
 
-    # print(accu)
     print(
         " * Prec@1 {top1.avg:.3f}%\tBest Prec@1 {best_prec1:.3f}%".format(
             top1=top1, best_prec1=best_prec1
@@ -412,11 +446,11 @@ class AverageMeter(object):
 
 
 def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.5 ** (epoch // 30))
+    """Sets the learning rate to the initial LR decayed by 0.5 every 10 epochs"""
+    lr = args.lr * (0.5 ** (epoch // 10))
     for param_group in optimizer.param_groups:
         param_group["lr"] = lr
-
+    print("Epoch {}: lr: {}".format(epoch, lr))
 
 def accuracy(output, target, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
